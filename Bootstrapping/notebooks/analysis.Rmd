@@ -1,0 +1,547 @@
+---
+title: "Caudate Bootstrapping Analysis"
+author: "Siddharth Reed"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        keep_md: true
+        toc: true
+        toc_float: true
+        theme: paper
+        code_folding: hide
+        df_print: paged
+---
+<style type="text/css">
+    .main-container {
+        max-width: 1800px !important;
+        margin-left: auto;
+        margin-right: auto;
+    }
+</style>
+
+# Dependencies
+
+```{r knitr}
+library(knitr)
+knitr::opts_chunk$set(
+    dev=c('png', 'pdf', 'tiff'),
+    dpi=300
+)
+```
+Set up file locations + load dependencies
+```{r dependencies, results=FALSE, message=FALSE, warning=FALSE}
+library(here)
+here::i_am('notebooks/analysis.Rmd')
+BASE_DIR <- here()
+SCRIPT_DIR <- here('scripts')
+source(file.path(SCRIPT_DIR, 'locations.R'))
+source(file.path(SCRIPT_DIR, 'plot_utils.R'))
+source(file.path(SCRIPT_DIR, 'bootstrap_utils.R'))
+library(tidyverse)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+# Compute DEG results in parallel on all bootstraps for each chunk (in serial)
+library(furrr)
+library(glue)
+message(glue('Using {length(availableWorkers())} threads'))
+plan(multisession, workers=length(availableWorkers()))
+```
+Load sample data + expression
+```{r load_external_data, message=FALSE}
+# Load sample metadata
+sample.metadata <- 
+    load_sample_metadata()  # in bootstrap.utils.R
+# Load counts
+counts.matrix <- 
+    load_counts()  # in bootstrap.utils.R
+# Load list of parameters for each model
+MODEL.TISSUE <- 'CAU'
+model.parameters <- 
+    load_model_specifications(
+        sample.metadata=sample.metadata,
+        output_dir=file.path(BOOTSTRAP_DIR, MODEL.TISSUE),
+    )
+```
+Set convenient variable specific for this model
+```{r set_params}
+MODEL.NAME                 <- 'SVA.only'
+TAF1_ENSEMBLID             <- 'ENSG00000147133'
+this.model.parameters      <- model.parameters %>% filter(model.name == MODEL.NAME)
+MODEL.FILENAME             <- this.model.parameters$model.filename[[1]]
+# MODEL.NAME                 <- this.model.parameters$model.name[[1]]
+EFFECT.VARIABLE            <- this.model.parameters$effect.variable[[1]]
+INCLUDE.SVS                <- this.model.parameters$include.SVs[[1]]
+COVARIATE.VARIABLES        <- this.model.parameters$covariate.variables[[1]] %>% str_split(',')
+FILTER.VARIABLE            <- this.model.parameters$filter.variable[[1]]
+CPM.CUTOFF                 <- this.model.parameters$CPM.cutoff[[1]]
+MIN.FRAC.SAMPLES.EXPRESSED <- this.model.parameters$min.frac.samples.expressed[[1]]
+INTERCEPT                  <- this.model.parameters$intercept[[1]]
+N.SAMPLES.PER.GROUP        <- this.model.parameters$n.samples.per.group[[1]]
+SEED                       <- this.model.parameters$seed[[1]]
+INFO.FILEPATH              <- this.model.parameters$info.filepath[[1]]
+MODEL.DIR                  <- this.model.parameters$model.dir[[1]]
+LIST.DIR                   <- this.model.parameters$list.dir[[1]]
+RESULTS.DIR                <- this.model.parameters$results.dir[[1]]
+```
+
+# Load Results with All Samples
+
+Load DESeq2 results using all samples as input
+```{r full_model}
+full.model.results <- 
+    file.path(MODEL.DIR, 'full.model.results.tsv') %>% 
+    read_tsv(show_col_types=FALSE) %>%
+    add_column(model.name=MODEL.NAME) %>% 
+    group_by(contrast) %>% 
+    mutate(fdr=p.adjust(pvalue, method='BH')) %>%
+    ungroup()
+```
+Print pvalue distributions
+```{r full_model_pvalues}
+full.model.results %>%
+    group_by(model.name, contrast) %>%
+    summarize(
+        as_tibble_row(summary(pvalue)),
+        as_tibble_row(summary(fdr))
+    )
+```
+
+# Summarize Bootstrap Results
+
+If you load all bootstrap results this will result in 
+```
+~20,000 genes * 50,000 bootstraps * 3 stats * C contrasts
+~= 4,000,000,000 row X 5 column dataframe per contrast
+```
+
+stats are (`pvalue`, `lfc`, `lfcSE`). 
+Thankfully only care about main contrast (Genotype XDP / Control).
+Instead we will summarize results for each chunk and aggregate summary stats, which leads to a ~20,000 row x 1+ column dataframe where each column is a summary stat or pattern frequency for that gene across all 50,000 bootstraps.
+```{r summarize_all_chunks, message=FALSE}
+bootstrap.summary.df <- 
+    model.parameters %>%
+    summarize_all_contrasts(
+        model.names=c('SVA.only'),
+        contrasts=c('Genotype-XDP-Control'),
+        force_redo=FALSE
+    )
+```
+Now print frequencies  distributions for different patterns
+```{r bootstrap_pattern_frequency_distribution_table, message=FALSE}
+bootstrap.summary.df %>% 
+    select(
+        -c(
+            EnsemblID,
+            model.params
+        )
+    ) %>% 
+    pivot_longer(
+        -c(
+            # EnsemblID,
+            model.name,
+            contrast
+        ),
+        names_to='stat',
+        values_to='value'
+    ) %>%
+    filter(str_detect(stat, 'freq.')) %>% 
+    group_by(
+        model.name,
+        contrast,
+        stat
+    ) %>% 
+    summarize(stats=as_tibble_row(summary(value, na.rm=TRUE))) %>% 
+    ungroup() %>% 
+    unnest(stats) %>%
+    separate_wider_delim(
+        'stat',
+        delim='.',
+        names=
+            c(
+                'stat',
+                'significance',
+                'direction'
+            )
+    ) %>%  
+    filter(
+        significance != 'any',
+        direction != 'either',
+    ) %>% 
+    arrange(
+        contrast,
+        desc(direction),
+        desc(significance)
+    ) %>% 
+    select(
+        -c(
+            model.name,
+            stat,
+            Min.,
+        )
+    )
+```
+
+# Check TAF1 expression
+
+Check expression of TAF1 in the full model (all samples) and across bootstraps.
+```{r check_TAF1_full}
+# bootstrap.summary.df %>% count(model.name, contrast, model.params, EnsemblID)
+# TAF1 results using all samples
+full.model.results %>%
+    filter(EnsemblID == TAF1_ENSEMBLID) %>% 
+    select(-c(variable, numerator, denominator))
+```
+```{r check_TAF1_bs}
+bootstrap.summary.df %>% 
+    filter(EnsemblID == TAF1_ENSEMBLID) %>% 
+    select(
+        -c(
+            EnsemblID,
+            model.params
+        )
+    ) %>% 
+    pivot_longer(
+        -c(
+            model.name,
+            contrast
+        ),
+        names_to='stat',
+        values_to='value'
+    ) %>%
+    filter(str_detect(stat, 'freq.')) %>% 
+    arrange(model.name, contrast, stat)
+```
+
+# Bootstrap Reproducibility Distributions {.tabset}
+
+```{r make_distribution_theme}
+theme_obj <- 
+    theme(
+        panel.grid.major=element_blank(), 
+        panel.grid.minor=element_blank(), 
+        panel.background=element_blank(),
+        axis.line=
+            element_line(
+                color="black",
+                linewidth=1/2.13
+            ),
+        axis.ticks=
+            element_line(
+                color="black",
+                linewidth=1/2.13
+            ),
+        axis.ticks.length=unit(3, "pt"),
+        axis.title=
+            element_text(
+                family="sans",
+                face="bold",
+                color="black",
+                size=10
+            ),
+        axis.text=
+            element_text(
+                family="sans",
+                face="bold",
+                color="black",
+                size=8
+            ),
+        legend.position='top',
+        strip.text=
+            element_text(
+                size=10,
+                face='bold'
+           ),
+    )
+```
+```{r distribution_plot_df}
+bootstrap.frequency.df <- 
+    bootstrap.summary.df %>% 
+    select(
+        c(
+            model.name,
+            contrast,
+            EnsemblID,
+            starts_with('freq.')
+        )
+    ) %>%
+    pivot_longer(
+        -c(
+            model.name,
+            contrast,
+            EnsemblID
+        ),
+        names_to='stat',
+        values_to='frequency'
+    ) %>%
+    separate_wider_delim(
+        'stat',
+        delim='.',
+        names=
+            c(
+                'tmp',
+                'significance',
+                'direction'
+            )
+    ) %>%  
+    select(-c(tmp))
+bootstrap.frequency.df
+```
+
+## Distribution across all bootstraps
+
+Distribution of frequency of each expression pattern observed across all genes 
+```{r distribution_plots, message=FALSE}
+bootstrap.frequency.df %>% 
+    filter(
+        # significance %in% c('fdr', 'nominal'),
+        # direction != 'either    '
+        significance != 'attempts',
+        !(significance == 'any' & direction == 'either')
+    ) %>% 
+    plot_distribution(
+        x_var='frequency',
+        facet_col='direction',
+        facet_row='significance',
+        scales='free_y',
+        expand=c(0.00, 0.00, 0.00, 0.00),
+        # label.size=3,
+        label.y=1000,
+        # alpha=0.8,
+        # linewidth=0.75,
+        binwidth=0.02,
+        # x_off=0.05, # 1725,
+        x_off=-0.02, # 1725,
+        theme_obj=theme_obj
+    ) +
+    scale_x_continuous(limits=c(-0.05, 1))
+```
+
+## Distributions for subsets of bootstraps
+
+Distribution of frequency of each expression pattern observed across all genes in different subsets of bootstraps, shows that frequency results are consistent between subsets.
+```{r subsampled_distribution_plots, eval=TRUE, message=FALSE}
+CONTRAST='Genotype-XDP-Control'
+subsample.frequency.df <- 
+    file.path(RESULTS.DIR, CONTRAST) %>% 
+    subsample_bootstraps(
+        model_name=MODEL.NAME,
+        contrast_name=CONTRAST,
+        n_subsamples=5,
+        seed=9
+    )
+subsample.frequency.df %>% 
+    filter(
+        # significance != 'attempts',
+        # direction != 'either    '
+        # !(significance == 'any' & direction == 'either')
+        significance %in% c('nominal', 'fdr'),
+        direction %in% c('down', 'up')
+    ) %>% 
+    plot_distribution(
+        x_var='frequency',
+        fill_var='chunk_id', 
+        # facet_group='expression_pattern',
+        facet_col='direction',
+        facet_row='significance',
+        scales='free_y',
+        alpha=0.5,
+        x_off=0.015,
+        label.y=3000,
+        theme_obj=theme_obj
+    ) +
+    scale_x_continuous(
+        limits=c(-0.05, NA),
+        expand=c(0.00, 0.00, 0.00, 0.00)
+    )
+```
+
+# Bootstrap Failures
+
+Distribution of bootstrap failure rate over all bootstraps across genes.
+Failure rate is the number of bootstraps where DESeq2 returns `NA` for the fold-change.
+```{r bootstrap_failure_rate}
+bootstrap.summary.df %>% 
+    dplyr::select(
+        c(
+            model.name,
+            contrast,
+            EnsemblID,
+            n.any.either,
+            n.attempts.either
+        )
+    ) %>%
+    dplyr::rename('n.successful.bootstraps'=n.any.either) %>% 
+    mutate(freq.successful.bootstraps=n.successful.bootstraps / n.attempts.either) %>%
+    # filter(freq.successful.bootstraps == 1)
+    ggplot(aes(x=freq.successful.bootstraps)) +
+    geom_histogram(
+        aes(y=after_stat(count)),
+        binwidth=0.02,
+        position='identity'
+    ) + 
+    labs(y='# of Genes') +
+    scale_y_continuous(
+        limits=c(0, NA),
+        expand=c(0.00, 0.00, 0.00, 0.00)
+    ) +
+    facet_grid(
+        cols=vars(model.name),
+        rows=vars(contrast),
+        scales='fixed'
+    ) + 
+    theme_obj
+```
+
+# Bootstrap Reproducibility vs DESeq2 Specificity {.tabset}
+
+```{r join_data}
+joint.results.df <- 
+    join_full_and_bootstrap_results(
+        bootstrap.summary.df,
+        full.model.results
+    )
+```
+```{r prep_plot_data}
+plot.df <- 
+    joint.results.df %>%
+    # unite('expression.pattern', c(significance, direction), sep='.', remove=TRUE) %>% 
+    mutate(
+        full.model.direction=
+            case_when(
+                log2FoldChange > 0 & fdr < 0.01 ~ 'Up in Full Model',
+                log2FoldChange < 0 & fdr < 0.01 ~ 'Down in Full Model',
+                TRUE ~ 'N.S'
+
+            )
+    ) %>% 
+    pivot_longer(
+        c(pvalue, fdr), 
+        names_to='full.model.significance',
+        values_to='full.model.pvalue'
+    ) %>% 
+    filter(contrast == 'Genotype-XDP-Control') %>% 
+    filter(full.model.significance == 'fdr')
+```
+```{r make_theme}
+theme_obj <- 
+    theme(
+        panel.grid.major=element_blank(), 
+        panel.grid.minor=element_blank(), 
+        panel.background=element_blank(),
+        axis.line=
+            element_line(
+                color="black",
+                linewidth=1/2.13
+            ),
+        axis.ticks=
+            element_line(
+                color="black",
+                linewidth=1/2.13
+            ),
+        axis.ticks.length=unit(3, "pt"),
+        axis.title=
+            element_text(
+                family="sans",
+                face="bold",
+                color="black",
+                size=10
+            ),
+        axis.text=
+            element_text(
+                family="sans",
+                face="bold",
+                color="black",
+                size=8
+            )
+    )
+```
+
+## All expresion patterns
+
+```{r bs_vs_deseq_all, message=FALSE}
+plot.df %>% 
+    plot_compare_results(
+        full.BH.thresh=0.01,
+        color_var='full.model.direction',
+    ) +
+    theme_obj
+```
+
+## Only relevant patterns for publication figure
+
+Only include the 4 relevant panels
+```{r bs_vs_deseq_pub, message=FALSE}
+plot.df %>% 
+    filter(
+        significance %in% c('nominal', 'fdr'),
+        direction %in% c('down', 'up'),
+    ) %>% 
+    plot_compare_results(
+        full.BH.thresh=0.01,
+        color_var='full.model.direction',
+    ) +
+    theme_obj
+```
+
+## Aloy Data vs Bootstrapping
+
+Now using aloy's data instead of the full model results
+```{r aloy_data, message=FALSE}
+ALOY_LFC_THRESHOLD <- 0.58
+aloy.plot.df <- 
+    file.path(BASE_DIR, 'DESeq2_alpha01_CAU.csv')  %>%
+    read_csv(show_col_types=FALSE) %>% 
+    dplyr::rename(
+        'EnsemblID'=ENSG,
+        'fdr'=padj
+    ) %>% 
+    add_column(
+        model.name='SVA.only',
+        contrast='Genotype-XDP-Control'
+    ) %>% 
+    join_full_and_bootstrap_results(
+        bootstrap.summary.df,
+        .
+    ) %>% 
+    # unite('expression.pattern', c(significance, direction), sep='.', remove=TRUE) %>% 
+    mutate(
+        full.model.direction=
+            case_when(
+                log2FoldChange >  ALOY_LFC_THRESHOLD & fdr < 0.01 ~ 'Up in Full Model',
+                log2FoldChange < -ALOY_LFC_THRESHOLD & fdr < 0.01 ~ 'Down in Full Model',
+                TRUE ~ 'N.S'
+
+            )
+    ) %>% 
+    pivot_longer(
+        c(pvalue, fdr), 
+        names_to='full.model.significance',
+        values_to='full.model.pvalue'
+    ) %>% 
+    filter(contrast == 'Genotype-XDP-Control') %>% 
+    filter(full.model.significance == 'fdr') %>% 
+    filter(
+        significance %in% c('nominal', 'fdr'),
+        direction %in% c('down', 'up'),
+    )
+```
+```{r bs_vs_deseq_aloy, message=FALSE}
+aloy.plot.df %>% 
+    plot_compare_results(
+        full.BH.thresh=0.01,
+        color_var='full.model.direction',
+        size=1
+    ) +
+    theme_obj
+```
+```{r bs_vs_deseq_aloy_fullcolor, message=FALSE}
+aloy.plot.df %>% 
+    plot_compare_results(
+        full.BH.thresh=0.01,
+        color_var='log2FoldChange',
+        alpha=0.7,
+        size=1
+    ) +
+    theme_obj
+```

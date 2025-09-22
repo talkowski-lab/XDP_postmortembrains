@@ -1,0 +1,10 @@
+model.name="SVA.only"
+effect.variable="Genotype"
+include.SVs=TRUE
+covariate.variables=""
+filter.variable="Genotype"
+CPM.cutoff=0.1
+min.frac.samples.expressed=0.5
+intercept=1
+n.samples.per.group=6
+seed=9
